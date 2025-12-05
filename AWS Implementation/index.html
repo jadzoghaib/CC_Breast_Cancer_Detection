@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Breast Cancer Risk System</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; max-width: 1000px; margin: 0 auto; padding: 20px; background-color: #f8f9fa; color: #333; }
+        .view { display: none; animation: fadeIn 0.5s; }
+        .active { display: block; }
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+        
+        /* Buttons */
+        .btn { padding: 12px 24px; margin: 5px; cursor: pointer; border-radius: 6px; font-size: 15px; border: none; transition: all 0.2s; font-weight: 600; }
+        .btn:disabled { opacity: 0.6; cursor: not-allowed; }
+        .btn-primary { background-color: #007bff; color: white; }
+        .btn-primary:hover { background-color: #0056b3; transform: translateY(-1px); }
+        .btn-success { background-color: #28a745; color: white; }
+        .btn-success:hover { background-color: #218838; }
+        .btn-danger { background-color: #dc3545; color: white; }
+        .btn-danger:hover { background-color: #c82333; }
+        .btn-outline { background: transparent; border: 1px solid #007bff; color: #007bff; }
+        .btn-outline:hover { background: #e7f1ff; }
+
+        /* File Upload */
+        .upload-area { border: 2px dashed #ccc; padding: 30px; text-align: center; background: white; border-radius: 10px; margin: 20px 0; transition: 0.3s; }
+        .upload-area:hover { border-color: #007bff; background: #f0f8ff; }
+        
+        /* Table */
+        .table-container { max-height: 400px; overflow: auto; margin: 20px 0; border: 1px solid #dee2e6; border-radius: 5px; background: white; display: none; }
+        table { width: 100%; border-collapse: collapse; font-size: 13px; white-space: nowrap; }
+        th, td { padding: 10px; text-align: left; border-bottom: 1px solid #dee2e6; }
+        th { background-color: #e9ecef; position: sticky; top: 0; z-index: 10; font-weight: 600; }
+        tr:hover { background-color: #f8f9fa; }
+
+        /* Cards */
+        .case-card { background: white; border-left: 5px solid #dc3545; border-radius: 5px; padding: 15px; margin: 10px 0; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 2px 8px rgba(0,0,0,0.05); }
+        .status-badge { padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: bold; }
+        .status-malignant { background: #ffebee; color: #c62828; }
+        
+        /* Logs */
+        #analysis-log { background: #2d2d2d; color: #00ff00; padding: 15px; border-radius: 5px; font-family: monospace; max-height: 200px; overflow-y: auto; margin-top: 20px; display: none; }
+    </style>
+    <script>
+        // --- CONFIGURATION ---
+        const PREDICT_URL = 'https://qu6y4f29lg.execute-api.eu-central-1.amazonaws.com/predict';
+
+        // --- CONSTANTS ---
+        const FEATURE_NAMES = [
+            "radius_mean", "texture_mean", "perimeter_mean", "area_mean", "smoothness_mean", "compactness_mean", "concavity_mean", "concave points_mean", "symmetry_mean", "fractal_dimension_mean",
+            "radius_se", "texture_se", "perimeter_se", "area_se", "smoothness_se", "compactness_se", "concavity_se", "concave points_se", "symmetry_se", "fractal_dimension_se",
+            "radius_worst", "texture_worst", "perimeter_worst", "area_worst", "smoothness_worst", "compactness_worst", "concavity_worst", "concave points_worst", "symmetry_worst", "fractal_dimension_worst"
+        ];
+
+        // --- STATE ---
+        let loadedData = []; // Stores objects: { id: string, features: number[] }
+        let openCases = [];  // Stores Malignant cases waiting for review
+
+        // --- NAVIGATION ---
+        function showView(viewId) {
+            document.querySelectorAll('.view').forEach(el => el.classList.remove('active'));
+            document.getElementById(viewId).classList.add('active');
+            if(viewId === 'cases-view') renderOpenCases();
+        }
+
+        // --- FILE HANDLING ---
+        function handleFileUpload(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                const text = e.target.result;
+                parseCSV(text, file.name);
+            };
+            reader.readAsText(file);
+        }
+
+        function parseCSV(csvText, fileName) {
+            try {
+                // 1. Extract Base ID from Filename
+                // Example: "sample_patient_569.csv" -> "569"
+                const nameNoExt = fileName.substring(0, fileName.lastIndexOf('.')) || fileName;
+                const parts = nameNoExt.split(/[_-\s]+/);
+                const baseId = parts[parts.length - 1];
+
+                const lines = csvText.split('\n').filter(line => line.trim() !== '');
+                loadedData = [];
+                
+                // Determine start row (Skip header if present)
+                let startRow = 0;
+                if (/[a-zA-Z]/.test(lines[0])) {
+                    startRow = 1;
+                }
+
+                // Parse rows
+                const tempRows = [];
+                for (let i = startRow; i < Math.min(lines.length, 101); i++) { 
+                    const rawValues = lines[i].split(',');
+                    
+                    // Filter for numeric values (to find features)
+                    const numericValues = rawValues
+                        .map(v => parseFloat(v))
+                        .filter(v => !isNaN(v));
+
+                    // We need at least 30 numeric features
+                    if (numericValues.length >= 30) {
+                        const features = numericValues.slice(-30);
+                        tempRows.push(features);
+                    }
+                }
+
+                if (tempRows.length === 0) {
+                    alert("Could not parse any valid rows with 30 numeric features. Please check your CSV format.");
+                    return;
+                }
+
+                // Assign IDs based on filename
+                loadedData = tempRows.map((features, index) => {
+                    // If single row, use the filename ID directly (e.g. "569")
+                    // If multiple rows, append index (e.g. "569-1", "569-2")
+                    let caseId = baseId;
+                    if (tempRows.length > 1) {
+                        caseId = `${baseId}-${index + 1}`;
+                    }
+                    return { id: caseId, features: features };
+                });
+
+                renderTable(loadedData);
+                document.getElementById('confirm-btn').disabled = false;
+                
+            } catch (e) {
+                console.error(e);
+                alert("Error parsing CSV: " + e.message);
+            }
+        }
+
+        function renderTable(data) {
+            const container = document.getElementById('table-container');
+            const tableHead = document.getElementById('data-table-head');
+            const tableBody = document.getElementById('data-table-body');
+            
+            // Clear previous
+            tableHead.innerHTML = '';
+            tableBody.innerHTML = '';
+
+            // Headers
+            const headerRow = document.createElement('tr');
+            
+            // ID Column Header
+            const thId = document.createElement('th');
+            thId.innerText = "Case ID"; 
+            thId.style.minWidth = "80px";
+            headerRow.appendChild(thId);
+            
+            // Feature Headers
+            FEATURE_NAMES.forEach(h => {
+                const th = document.createElement('th');
+                th.innerText = h;
+                headerRow.appendChild(th);
+            });
+            tableHead.appendChild(headerRow);
+
+            // Rows
+            data.forEach((item) => {
+                const tr = document.createElement('tr');
+                
+                // ID Cell
+                const tdId = document.createElement('td');
+                tdId.innerText = item.id; 
+                tdId.style.fontWeight = "bold";
+                tdId.style.backgroundColor = "#f8f9fa";
+                tr.appendChild(tdId);
+
+                // Feature Cells
+                item.features.forEach(val => {
+                    const td = document.createElement('td');
+                    td.innerText = val; 
+                    tr.appendChild(td);
+                });
+                tableBody.appendChild(tr);
+            });
+
+            container.style.display = 'block';
+        }
+
+        function confirmData() {
+            if (loadedData.length > 0) {
+                document.getElementById('analyze-btn').disabled = false;
+                alert(`Data Confirmed! ${loadedData.length} patient records ready for analysis.`);
+            } else {
+                alert("No data to confirm. Please upload a valid CSV.");
+            }
+        }
+
+        // --- LOGIC: BATCH ANALYSIS ---
+        async function analyzeRisk() {
+            if (!loadedData || loadedData.length === 0) {
+                alert("No data loaded. Please upload a CSV first.");
+                return;
+            }
+
+            showView('analyze-view');
+            
+            // MIRROR TABLE TO ANALYZE VIEW
+            const originalTable = document.getElementById('table-container').innerHTML;
+            const targetContainer = document.getElementById('analysis-table-container');
+            targetContainer.innerHTML = originalTable;
+            targetContainer.style.display = 'block';
+
+            const logDiv = document.getElementById('analysis-log');
+            logDiv.style.display = 'block';
+            logDiv.innerHTML = "Starting analysis...\n";
+
+            let processed = 0;
+            
+            // Iterate through loaded data
+            for (let i = 0; i < loadedData.length; i++) {
+                const item = loadedData[i];
+                const features = item.features;
+                const patientId = item.id; 
+
+                try {
+                    // Call API
+                    const response = await fetch(PREDICT_URL, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ features: features, id: patientId })
+                    });
+
+                    // ERROR HANDLING: Check if the request failed (e.g. 500 or 400)
+                    if (!response.ok) {
+                        const errorText = await response.text();
+                        throw new Error(`Server Error (${response.status}): ${errorText}`);
+                    }
+
+                    const result = await response.json();
+                    const prediction = result.prediction;
+
+                    // VALIDATION: Check if prediction is missing
+                    if (prediction === undefined) {
+                        throw new Error("Invalid response: 'prediction' field missing.");
+                    }
+
+                    processed++;
+                    
+                    if (prediction === 'M') {
+                        // LOGIC: If Malignant -> Add to Open Cases
+                        openCases.push({
+                            id: patientId,
+                            features: features,
+                            date: new Date().toLocaleDateString(),
+                            status: 'Malignant'
+                        });
+                        logDiv.innerHTML += `[${patientId}] -> MALIGNANT (Added to Open Cases)\n`;
+                    } else {
+                        // LOGIC: If Benign -> Auto-save to DB
+                        logDiv.innerHTML += `[${patientId}] -> Benign (Archived to DB)\n`;
+                    }
+
+                } catch (error) {
+                    logDiv.innerHTML += `[${patientId}] Error: ${error.message}\n`;
+                }
+                
+                // Auto-scroll log
+                logDiv.scrollTop = logDiv.scrollHeight;
+            }
+
+            logDiv.innerHTML += `\nAnalysis Complete. ${openCases.length} new cases require review.`;
+        }
+
+        // --- LOGIC: OPEN CASES ---
+        function renderOpenCases() {
+            const list = document.getElementById('cases-list');
+            list.innerHTML = '';
+
+            if (openCases.length === 0) {
+                list.innerHTML = "<p style='text-align:center; color:#666;'>No open cases found.</p>";
+                return;
+            }
+
+            openCases.forEach(c => {
+                const item = document.createElement('div');
+                item.className = 'case-card';
+                item.innerHTML = `
+                    <div>
+                        <strong>ID: ${c.id}</strong> <span style="color:#999; font-size:0.9em">(${c.date})</span><br>
+                        <span class="status-badge status-malignant">Potential Malignancy</span>
+                    </div>
+                    <div>
+                        <button class="btn btn-success" onclick="resolveCase('${c.id}', 'Confirmed')">✓ Confirm</button>
+                        <button class="btn btn-danger" onclick="resolveCase('${c.id}', 'False Positive')">X False Positive</button>
+                    </div>
+                `;
+                list.appendChild(item);
+            });
+        }
+
+        function resolveCase(id, resolution) {
+            // Find the case data to send back to the backend
+            const caseData = openCases.find(c => c.id === id);
+            const features = caseData ? caseData.features : [];
+            
+            if(confirm(`Mark case ${id} as ${resolution}?`)) {
+                
+                // 1. Prepare the payload
+                // We add 'operation': 'feedback' so the Lambda knows this isn't a new prediction
+                const payload = {
+                    operation: 'feedback',
+                    id: id,
+                    resolution: resolution
+                };
+
+                // 2. Send to API
+                fetch(PREDICT_URL, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                })
+                .then(response => {
+                    if (!response.ok) {
+                        throw new Error(`Server responded with ${response.status}`);
+                    }
+                    return response.json();
+                })
+                .then(data => {
+                    // 3. Success Handling
+                    alert(`✅ Success! Feedback saved to DynamoDB.\nCase ${id} marked as ${resolution}.`);
+                    
+                    // Remove from the list
+                    openCases = openCases.filter(c => c.id !== id);
+                    renderOpenCases();
+                })
+                .catch(error => {
+                    // 4. Error Handling (The "Why it didn't work" part)
+                    console.error("Feedback Error:", error);
+                    alert(`❌ Action Failed: Could not save to DynamoDB.\n\nReason: ${error.message}\n\nWhy is this happening?\n1. The Lambda function might not be updated yet to handle "feedback" requests.\n2. The DynamoDB table might be missing or named incorrectly.\n3. The API Gateway might be blocking the request (CORS).\n\nPlease check your Lambda logs for more details.`);
+                });
+            }
+        }
+    </script>
+</head>
+<body>
+
+    <!-- HOME VIEW -->
+    <div id="home-view" class="view active">
+        <h1 style="text-align:center;">Breast Cancer Risk System</h1>
+        
+        <!-- Upload Section -->
+        <div class="upload-area">
+            <h3>📂 Upload Patient Data</h3>
+            <p>Drag and drop your CSV file here or click to browse</p>
+            <input type="file" id="csvFileInput" accept=".csv" onchange="handleFileUpload(event)" />
+        </div>
+
+        <!-- Data Preview Table -->
+        <div id="table-container" class="table-container">
+            <table id="data-table">
+                <thead id="data-table-head"></thead>
+                <tbody id="data-table-body"></tbody>
+            </table>
+        </div>
+
+        <!-- Actions -->
+        <div style="text-align:center; margin-top: 20px;">
+            <button id="confirm-btn" class="btn btn-success" onclick="confirmData()" disabled>✓ Confirm Data</button>
+            <button id="analyze-btn" class="btn btn-primary" onclick="analyzeRisk()" disabled>⚡ Analyze Risk</button>
+            <button class="btn btn-outline" onclick="showView('cases-view')">📂 Open Cases</button>
+        </div>
+    </div>
+
+    <!-- ANALYZE VIEW (Log Output) -->
+    <div id="analyze-view" class="view">
+        <button onclick="showView('home-view')" class="btn btn-outline">← Back to Home</button>
+        <h2>Analysis in Progress</h2>
+        
+        <!-- MIRRORED TABLE -->
+        <div id="analysis-table-container" class="table-container"></div>
+
+        <p>Processing uploaded records against the AI model...</p>
+        
+        <div id="analysis-log"></div>
+        
+        <div style="margin-top: 20px; text-align: center;">
+            <button class="btn btn-primary" onclick="showView('cases-view')">Go to Open Cases Review</button>
+        </div>
+    </div>
+
+    <!-- OPEN CASES VIEW -->
+    <div id="cases-view" class="view">
+        <button onclick="showView('home-view')" class="btn btn-outline">← Back to Home</button>
+        <h2>Open Cases</h2>
+        <p>The following cases were flagged as <strong>Malignant</strong> and require doctor confirmation.</p>
+        <div id="cases-list"></div>
+    </div>
+
+</body>
+</html>
